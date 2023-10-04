@@ -68,4 +68,10 @@ library WeightedPoolUserData {
     {
         (, amountsOut, maxBPTAmountIn) = abi.decode(self, (ExitKind, uint256[], uint256));
     }
+
+    // Swaps
+
+    function customSwapFeePercentage(bytes memory self) internal pure returns (uint256) {
+        return abi.decode(self, (uint256));
+    }
 }

@@ -30,10 +30,12 @@ import "./WeightedMath.sol";
  * the weights to subclasses. Derived contracts can choose to make weights immutable, mutable, or even dynamic
  *  based on local or external logic.
  */
-abstract contract BaseWeightedPool is BaseMinimalSwapInfoPool {
+abstract contract BaseWeightedPool is IMinimalSwapInfoPool, BasePool {
     using FixedPoint for uint256;
     using BasePoolUserData for bytes;
     using WeightedPoolUserData for bytes;
+
+    address public customSwapFeePermissionedActor = address(0);
 
     constructor(
         IVault vault,
@@ -108,7 +110,7 @@ abstract contract BaseWeightedPool is BaseMinimalSwapInfoPool {
         SwapRequest memory swapRequest,
         uint256 currentBalanceTokenIn,
         uint256 currentBalanceTokenOut
-    ) internal virtual override returns (uint256) {
+    ) internal virtual returns (uint256) {
         return
             WeightedMath._calcOutGivenIn(
                 currentBalanceTokenIn,
@@ -123,7 +125,7 @@ abstract contract BaseWeightedPool is BaseMinimalSwapInfoPool {
         SwapRequest memory swapRequest,
         uint256 currentBalanceTokenIn,
         uint256 currentBalanceTokenOut
-    ) internal virtual override returns (uint256) {
+    ) internal virtual returns (uint256) {
         return
             WeightedMath._calcInGivenOut(
                 currentBalanceTokenIn,
@@ -464,5 +466,82 @@ abstract contract BaseWeightedPool is BaseMinimalSwapInfoPool {
     ) internal pure override returns (uint256 bptAmountIn, uint256[] memory amountsOut) {
         bptAmountIn = userData.recoveryModeExit();
         amountsOut = BasePoolMath.computeProportionalAmountsOut(balances, totalSupply, bptAmountIn);
+    }
+
+    // Swap fee
+
+    function setCustomSwapFeePermissionedActor(address actor) external {
+        _setCustomSwapFeePermissionedActor(actor);
+    }
+
+    function _setCustomSwapFeePermissionedActor(address actor) internal virtual {
+        customSwapFeePermissionedActor = actor;
+    }
+
+    function _isCustomSwapFeePermissionedActor() internal view virtual returns (bool) {
+        return tx.origin == customSwapFeePermissionedActor;
+    }
+
+    function getSwapFeePercentage() public override(IBasePool, BasePool) view returns (uint256) {
+        return getSwapFeePercentage(0);
+    }
+
+    function getSwapFeePercentage(uint256 customSwapFeePercentage) public view returns (uint256) {
+        return _isCustomSwapFeePermissionedActor() ? super.getSwapFeePercentage() : customSwapFeePercentage;
+    }
+
+    /**
+     * @dev Adds swap fee amount to `amount`, returning a higher value.
+     */
+    function _addSwapFeeAmount(uint256 amount, bytes memory userData) internal view returns (uint256) {
+        // This returns amount + fee amount, so we round up (favoring a higher fee amount).
+        return amount.divUp(getSwapFeePercentage(userData.customSwapFeePercentage()).complement());
+    }
+
+    /**
+     * @dev Subtracts swap fee amount from `amount`, returning a lower value.
+     */
+    function _subtractSwapFeeAmount(uint256 amount, bytes memory userData) internal view returns (uint256) {
+        // This returns amount - fee amount, so we round up (favoring a higher fee amount).
+        uint256 feeAmount = amount.mulUp(getSwapFeePercentage(userData.customSwapFeePercentage()));
+        return amount.sub(feeAmount);
+    }
+
+    function onSwap(
+        SwapRequest memory request,
+        uint256 balanceTokenIn,
+        uint256 balanceTokenOut
+    ) public override onlyVault(request.poolId) returns (uint256) {
+        _beforeSwapJoinExit();
+
+        uint256 scalingFactorTokenIn = _scalingFactor(request.tokenIn);
+        uint256 scalingFactorTokenOut = _scalingFactor(request.tokenOut);
+
+        balanceTokenIn = _upscale(balanceTokenIn, scalingFactorTokenIn);
+        balanceTokenOut = _upscale(balanceTokenOut, scalingFactorTokenOut);
+
+        if (request.kind == IVault.SwapKind.GIVEN_IN) {
+            // Fees are subtracted before scaling, to reduce the complexity of the rounding direction analysis.
+            request.amount = _subtractSwapFeeAmount(request.amount, request.userData);
+
+            // All token amounts are upscaled.
+            request.amount = _upscale(request.amount, scalingFactorTokenIn);
+
+            uint256 amountOut = _onSwapGivenIn(request, balanceTokenIn, balanceTokenOut);
+
+            // amountOut tokens are exiting the Pool, so we round down.
+            return _downscaleDown(amountOut, scalingFactorTokenOut);
+        } else {
+            // All token amounts are upscaled.
+            request.amount = _upscale(request.amount, scalingFactorTokenOut);
+
+            uint256 amountIn = _onSwapGivenOut(request, balanceTokenIn, balanceTokenOut);
+
+            // amountIn tokens are entering the Pool, so we round up.
+            amountIn = _downscaleUp(amountIn, scalingFactorTokenIn);
+
+            // Fees are added after scaling happens, to reduce the complexity of the rounding direction analysis.
+            return _addSwapFeeAmount(amountIn, request.userData);
+        }
     }
 }
